@@ -1,0 +1,188 @@
+import json
+import os
+
+from planner import generate_festival_plan
+from judge import evaluate_festival_plan
+from simulator import simulate_festival
+from festival_environment import evaluate_environment
+
+
+MAX_ATTEMPTS = max(1, min(6, int(os.getenv("MAX_ATTEMPTS", "3"))))
+
+
+def build_feedback(evaluation: dict, environment_report: dict, simulation: dict | None) -> dict:
+    """Everything the planner needs to fix the next revision."""
+    feedback = {
+        "judge_verdict": evaluation.get("verdict"),
+        "judge_score": evaluation.get("overall_score"),
+        "issues": evaluation.get("issues", []),
+        "safety_critical_gaps": evaluation.get("safety_critical_gaps", []),
+        "recommendations": evaluation.get("recommendations", []),
+        "environment_checks": environment_report["environment_checks"],
+        "required_action": (
+            "Revise the plan to address these failures. "
+            "Recalculate the budget and verify all arithmetic."
+        ),
+    }
+
+    if simulation:
+        feedback["simulated_incident_failures"] = [
+            {
+                "scenario": item["name"],
+                "resilience_score": item["resilience_score"],
+                "plan_held": item["plan_held"],
+                "failure_points": item["failure_points"],
+                "recommended_fixes": item["recommended_fixes"],
+            }
+            for item in simulation["scenarios"]
+            if not item["plan_held"] or item["resilience_score"] < 70
+        ]
+
+    return feedback
+
+
+def run_festival_pipeline(
+    festival_details: str,
+    budget_limit: int,
+    max_attempts: int = MAX_ATTEMPTS,
+    verbose: bool = False,
+) -> dict:
+    """Planner -> Judge -> Rule checks -> LLM simulation -> feedback loop.
+
+    Shared by the CLI (this file) and the FastAPI endpoint (api.py).
+    """
+
+    def log(title, payload=None):
+        if verbose:
+            print(f"\n=== {title} ===")
+            if payload is not None:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    previous_plan = None
+    feedback = None
+    plan = evaluation = environment_report = simulation = None
+    history = []
+    warnings = []
+    attempt = 0
+
+    for attempt in range(1, max_attempts + 1):
+        log(f"ATTEMPT {attempt}")
+
+        # 1. Planner generates or revises the plan.
+        try:
+            new_plan = generate_festival_plan(
+                festival_details,
+                previous_plan=previous_plan,
+                feedback=feedback,
+                budget_limit=budget_limit,
+            )
+        except ValueError as exc:
+            if plan is None:
+                raise
+            # Keep the best plan so far instead of discarding everything.
+            warnings.append(f"Attempt {attempt} planner failed: {exc}")
+            attempt -= 1
+            break
+
+        plan = new_plan
+        log("STEP 1: PLANNER", plan)
+
+        # 2. Judge independently evaluates the plan.
+        evaluation = evaluate_festival_plan(festival_details, plan)
+        log("STEP 2: JUDGE", evaluation)
+
+        # 3. LLM-simulated environment plays out incidents against the plan.
+        simulation = None
+        simulation_error = None
+        try:
+            simulation = simulate_festival(festival_details, plan)
+            log("STEP 3: SIMULATED INCIDENTS", simulation)
+        except Exception as exc:  # bad model id, rate limit, invalid output
+            simulation_error = f"{type(exc).__name__}: {exc}"[:300]
+            warnings.append(f"Attempt {attempt} simulation failed: {exc}")
+
+        # 4. Deterministic environment checks decide the outcome.
+        environment_report = evaluate_environment(
+            plan=plan,
+            evaluation=evaluation,
+            budget_limit=budget_limit,
+            simulation=simulation,
+            simulation_error=simulation_error,
+        )
+        log("STEP 4: ENVIRONMENT", environment_report)
+
+        checks = environment_report["environment_checks"]
+        history.append({
+            "attempt": attempt,
+            "judge_score": evaluation.get("overall_score"),
+            "judge_verdict": evaluation.get("verdict"),
+            "simulation_score": simulation["average_score"] if simulation else None,
+            "checks_passed": sum(1 for c in checks if c["passed"]),
+            "checks_total": len(checks),
+            "decision": environment_report["decision"],
+        })
+
+        if environment_report["decision"] != "REVISION_REQUIRED":
+            break
+
+        previous_plan = plan
+        feedback = build_feedback(evaluation, environment_report, simulation)
+
+    return {
+        "attempts": attempt,
+        "plan": plan,
+        "evaluation": evaluation,
+        "simulation": simulation,
+        "environment": environment_report,
+        "history": history,
+        "warnings": warnings,
+    }
+
+
+def main():
+    festival_details = """
+    Festival: Riverside Cultural Festival
+    Duration: 1 day
+    Expected attendance: 5000 people
+    Budget: INR 500000
+    Location: Outdoor public ground
+    Requirements: Music performances, food stalls,
+    family activities and accessible facilities.
+    """
+
+    result = run_festival_pipeline(
+        festival_details,
+        budget_limit=500000,
+        verbose=True,
+    )
+
+    environment = result["environment"]
+    evaluation = result["evaluation"]
+
+    print("\n=== FINAL RESULT ===")
+    print(f"Attempts completed: {result['attempts']}")
+    print(f"Last judge score: {evaluation.get('overall_score')}/100")
+    print(f"Last judge verdict: {evaluation.get('verdict')}")
+    if result["simulation"]:
+        print(f"Simulated resilience: {result['simulation']['average_score']}/100")
+    print(f"Environment decision: {environment['decision']}")
+
+    for item in result["history"]:
+        print(
+            f"  attempt {item['attempt']}: judge {item['judge_score']}, "
+            f"sim {item['simulation_score']}, {item['decision']}"
+        )
+
+    if environment["decision"] == "READY_FOR_HUMAN_REVIEW":
+        print("Automated checks passed. Human approval is still required.")
+    elif environment["decision"] == "HUMAN_REVIEW_REQUIRED":
+        print("External verification is required:")
+        for item in environment["external_verification_pending"]:
+            print(f"- {item}")
+        print("Human approval is required before real-world use.")
+    else:
+        print("The plan still needs revision and human review.")
+
+
+if __name__ == "__main__":
+    main()
